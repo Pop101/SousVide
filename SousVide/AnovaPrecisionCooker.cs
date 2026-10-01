@@ -42,6 +42,8 @@ public class AnovaPrecisionCooker: ISousVide {
     private TemperatureUnit               temperatureUnit = TemperatureUnit.DegreeFahrenheit;
 
     private volatile bool isConnected;
+    private int polling;
+    private int disposed;
 
     /// <summary>[anovaslop patch] True while the BLE connection is healthy.</summary>
     public bool IsConnected => isConnected;
@@ -98,12 +100,26 @@ public class AnovaPrecisionCooker: ISousVide {
         IReadOnlyCollection<InTheHand.Bluetooth.BluetoothDevice> allDevices = await Bluetooth.GetPairedDevicesAsync().ConfigureAwait(false);
         try {
             if (allDevices.FirstOrDefault(dev => dev.Name == DeviceName && (deviceId == null || deviceId == dev.Id)) is { } device) {
-                AnovaPrecisionCooker sousVide = new(new BluetoothDevice(device));
-                await sousVide.Connect().ConfigureAwait(false);
-                return sousVide;
+                return await CreateConnected(new BluetoothDevice(device)).ConfigureAwait(false);
             }
         } catch (UnsupportedDevice) { } /* return null below */
         return null;
+    }
+
+    // A failed handshake must not leave subscribed clients behind on every reconnect attempt.
+    internal static async Task<AnovaPrecisionCooker> CreateConnected(IBluetoothDevice device) {
+        AnovaPrecisionCooker cooker = new(device);
+        try {
+            await cooker.Connect().ConfigureAwait(false);
+            return cooker;
+        } catch {
+#if NETCOREAPP
+            await cooker.DisposeAsync().ConfigureAwait(false);
+#else
+            cooker.Dispose();
+#endif
+            throw;
+        }
     }
 
     /// <summary>Connect to this instance over Bluetooth and initialize the state of this client.</summary>
@@ -139,11 +155,14 @@ public class AnovaPrecisionCooker: ISousVide {
 
     // [anovaslop patch] async-void timer callbacks must not crash the host.
     private async void UpdatePropertiesVoid(object? sender, ElapsedEventArgs e) {
+        if (Volatile.Read(ref disposed) != 0 || Interlocked.Exchange(ref polling, 1) != 0) return;
         try {
             await UpdateProperties().ConfigureAwait(false);
         } catch (Exception) {
             isConnected = false;
-            timer.Enabled = false;
+            try { timer.Enabled = false; } catch (ObjectDisposedException) { }
+        } finally {
+            Volatile.Write(ref polling, 0);
         }
     }
 
@@ -193,15 +212,16 @@ public class AnovaPrecisionCooker: ISousVide {
     protected virtual async Task<string> SendRequestAndReceiveResponse(string command) {
         await serializeRequestsMutex.WaitAsync().ConfigureAwait(false);
         try {
-            currentResponseHandler = new TaskCompletionSource<string>();
+            var response = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            currentResponseHandler = response;
 
             await SendCommandInternal(command).ConfigureAwait(false);
 
 #if NET6_0_OR_GREATER
             // [anovaslop patch] bound dead-link waits so callers can recover.
-            return await currentResponseHandler.Task.WaitAsync(ResponseTimeout).ConfigureAwait(false);
+            return await response.Task.WaitAsync(ResponseTimeout).ConfigureAwait(false);
 #else
-            return await currentResponseHandler.Task.ConfigureAwait(false);
+            return await response.Task.ConfigureAwait(false);
 #endif
         } finally {
             currentResponseHandler = null;
@@ -210,6 +230,8 @@ public class AnovaPrecisionCooker: ISousVide {
     }
 
     private async Task SendCommandInternal(string command) {
+        if (Volatile.Read(ref disposed) != 0) throw new ObjectDisposedException(nameof(AnovaPrecisionCooker));
+        if (!isConnected) throw new IOException("Cooker Bluetooth link is disconnected.");
         command = command.Trim();
         Trace.WriteLine(command, "ble-tx");
         await characteristic!.WriteValueWithoutResponseAsync(Encoding.GetBytes(command + '\r')).ConfigureAwait(false);
@@ -224,9 +246,7 @@ public class AnovaPrecisionCooker: ISousVide {
         if (e.Value is { } value) {
             string message = Encoding.GetString(value).Trim();
             Trace.WriteLine(message, "ble-rx");
-            if (message != ResponseInvalidCommand && currentResponseHandler != null) {
-                currentResponseHandler.TrySetResult(message);
-            }
+            if (message != ResponseInvalidCommand) currentResponseHandler?.TrySetResult(message);
         }
     }
 
@@ -265,13 +285,16 @@ public class AnovaPrecisionCooker: ISousVide {
 
     private void onDisconnection(object? sender, EventArgs e) {
         isConnected   = false;
-        timer.Enabled = false; // [anovaslop patch] stop polling a dead link so requests don't pile up behind the mutex
+        try { timer.Enabled = false; } catch (ObjectDisposedException) { }
+        currentResponseHandler?.TrySetException(new IOException("Cooker Bluetooth link disconnected."));
     }
 
     /// <inheritdoc cref="Dispose()" />
     protected virtual void Dispose(bool disposing) {
-        if (disposing) {
+        if (disposing && Interlocked.Exchange(ref disposed, 1) == 0) {
+            isConnected = false;
             timer.Dispose();
+            currentResponseHandler?.TrySetException(new ObjectDisposedException(nameof(AnovaPrecisionCooker)));
             if (characteristic != null) {
                 characteristic.CharacteristicValueChanged -= OnResponseReceived;
                 characteristic                            =  null;
@@ -281,7 +304,7 @@ public class AnovaPrecisionCooker: ISousVide {
             device.GattServerDisconnected -= onDisconnection;
             server.Disconnect();
             currentResponseHandler = null;
-            serializeRequestsMutex.Dispose();
+            // An in-flight request still releases this gate; let GC reclaim it afterward.
         }
     }
 
