@@ -42,19 +42,9 @@ public class AnovaPrecisionCooker: ISousVide {
     private TemperatureUnit               temperatureUnit = TemperatureUnit.DegreeFahrenheit;
 
     private volatile bool isConnected;
-    private long lastResponseAtUtcTicks = DateTimeOffset.UtcNow.UtcTicks; // [anovaslop patch] watchdog liveness signal
 
-    /// <summary>
-    /// [anovaslop patch] True while the BLE GATT link is up. Exposed so the hosting
-    /// service's reconnect watchdog can tell a live link from a silently dead one.
-    /// </summary>
+    /// <summary>[anovaslop patch] True while the BLE connection is healthy.</summary>
     public bool IsConnected => isConnected;
-
-    /// <summary>
-    /// [anovaslop patch] Time the last response was received from the cooker. The
-    /// periodic property poll keeps this fresh while the link is healthy.
-    /// </summary>
-    public DateTimeOffset LastResponseAt => new(Interlocked.Read(ref lastResponseAtUtcTicks), TimeSpan.Zero);
 
     /// <summary>
     /// <inheritdoc path="/summary" />
@@ -147,14 +137,13 @@ public class AnovaPrecisionCooker: ISousVide {
         }
     }
 
-    // [anovaslop patch] an async-void timer callback must never throw: a poll that is
-    // in flight while the link drops (or while the object is disposed mid-reconnect)
-    // would otherwise crash the whole process.
+    // [anovaslop patch] async-void timer callbacks must not crash the host.
     private async void UpdatePropertiesVoid(object? sender, ElapsedEventArgs e) {
         try {
             await UpdateProperties().ConfigureAwait(false);
         } catch (Exception) {
-            // link is dead; the hosting service's watchdog handles reconnection
+            isConnected = false;
+            timer.Enabled = false;
         }
     }
 
@@ -209,7 +198,7 @@ public class AnovaPrecisionCooker: ISousVide {
             await SendCommandInternal(command).ConfigureAwait(false);
 
 #if NET6_0_OR_GREATER
-            // [anovaslop patch] bound the wait so a dead link fails fast instead of hanging the caller forever
+            // [anovaslop patch] bound dead-link waits so callers can recover.
             return await currentResponseHandler.Task.WaitAsync(ResponseTimeout).ConfigureAwait(false);
 #else
             return await currentResponseHandler.Task.ConfigureAwait(false);
@@ -233,7 +222,6 @@ public class AnovaPrecisionCooker: ISousVide {
     /// <param name="e">response bytes</param>
     protected virtual void OnResponseReceived(object? sender, GattCharacteristicValueChangedEventArgs e) {
         if (e.Value is { } value) {
-            Interlocked.Exchange(ref lastResponseAtUtcTicks, DateTimeOffset.UtcNow.UtcTicks); // [anovaslop patch]
             string message = Encoding.GetString(value).Trim();
             Trace.WriteLine(message, "ble-rx");
             if (message != ResponseInvalidCommand && currentResponseHandler != null) {
