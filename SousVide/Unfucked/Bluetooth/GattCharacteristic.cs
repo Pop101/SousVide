@@ -1,4 +1,4 @@
-﻿namespace SousVide.Unfucked.Bluetooth;
+namespace SousVide.Unfucked.Bluetooth;
 
 /// <inheritdoc cref="InTheHand.Bluetooth.GattCharacteristic" />
 public interface IGattCharacteristic {
@@ -8,6 +8,9 @@ public interface IGattCharacteristic {
 
     /// <inheritdoc cref="InTheHand.Bluetooth.GattCharacteristic.WriteValueWithoutResponseAsync" />
     Task WriteValueWithoutResponseAsync(byte[] value);
+
+    /// <inheritdoc cref="InTheHand.Bluetooth.GattCharacteristic.StartNotificationsAsync" />
+    Task StartNotificationsAsync();
 
     /// <inheritdoc cref="InTheHand.Bluetooth.GattCharacteristic.StopNotificationsAsync" />
     Task StopNotificationsAsync();
@@ -46,6 +49,9 @@ public class GattCharacteristic(InTheHand.Bluetooth.GattCharacteristic character
 
     /// <inheritdoc />
     public Task WriteValueWithoutResponseAsync(byte[] value) => characteristic.WriteValueWithoutResponseAsync(value);
+
+    /// <inheritdoc />
+    public Task StartNotificationsAsync() => characteristic.StartNotificationsAsync();
 
     /// <inheritdoc />
     public Task StopNotificationsAsync() => characteristic.StopNotificationsAsync();

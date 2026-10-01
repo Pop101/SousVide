@@ -1,4 +1,4 @@
-﻿using InTheHand.Bluetooth;
+using InTheHand.Bluetooth;
 using KoKo.Events;
 using KoKo.Property;
 using SousVide.Exceptions;
@@ -28,6 +28,7 @@ public class AnovaPrecisionCooker: ISousVide {
     private static readonly BluetoothUuid                  ServiceId                     = BluetoothUuid.FromShortId(0xffe0);
     private static readonly BluetoothUuid                  CharacteristicId              = BluetoothUuid.FromShortId(0xffe1);
     private static readonly TimeSpan                       DefaultPropertyUpdateInterval = new(0, 0, 1);
+    private static readonly TimeSpan                       ResponseTimeout               = new(0, 0, 10); // [anovaslop patch]
     private static readonly IEqualityComparer<Temperature> TemperatureComparer           = new TolerantTemperatureComparer(Temperature.FromDegreesFahrenheit(0.05));
 
     private readonly SemaphoreSlim     serializeRequestsMutex = new(1);
@@ -41,6 +42,19 @@ public class AnovaPrecisionCooker: ISousVide {
     private TemperatureUnit               temperatureUnit = TemperatureUnit.DegreeFahrenheit;
 
     private volatile bool isConnected;
+    private long lastResponseAtUtcTicks = DateTimeOffset.UtcNow.UtcTicks; // [anovaslop patch] watchdog liveness signal
+
+    /// <summary>
+    /// [anovaslop patch] True while the BLE GATT link is up. Exposed so the hosting
+    /// service's reconnect watchdog can tell a live link from a silently dead one.
+    /// </summary>
+    public bool IsConnected => isConnected;
+
+    /// <summary>
+    /// [anovaslop patch] Time the last response was received from the cooker. The
+    /// periodic property poll keeps this fresh while the link is healthy.
+    /// </summary>
+    public DateTimeOffset LastResponseAt => new(Interlocked.Read(ref lastResponseAtUtcTicks), TimeSpan.Zero);
 
     /// <summary>
     /// <inheritdoc path="/summary" />
@@ -122,6 +136,10 @@ public class AnovaPrecisionCooker: ISousVide {
             characteristic = await service.GetCharacteristicAsync(CharacteristicId).ConfigureAwait(false);
 
             characteristic!.CharacteristicValueChanged += OnResponseReceived;
+            // [anovaslop patch] InTheHand's Linux event subscription only watches
+            // D-Bus properties and never writes the CCC descriptor; explicitly
+            // start notifications or the cooker's responses never arrive.
+            await characteristic.StartNotificationsAsync().ConfigureAwait(false);
 
             temperatureUnit = await SendRequestAndReceiveResponse("read unit").ConfigureAwait(false) == "f" ? TemperatureUnit.DegreeFahrenheit : TemperatureUnit.DegreeCelsius;
             await UpdateProperties().ConfigureAwait(false);
@@ -129,7 +147,16 @@ public class AnovaPrecisionCooker: ISousVide {
         }
     }
 
-    private async void UpdatePropertiesVoid(object? sender, ElapsedEventArgs e) => await UpdateProperties().ConfigureAwait(false);
+    // [anovaslop patch] an async-void timer callback must never throw: a poll that is
+    // in flight while the link drops (or while the object is disposed mid-reconnect)
+    // would otherwise crash the whole process.
+    private async void UpdatePropertiesVoid(object? sender, ElapsedEventArgs e) {
+        try {
+            await UpdateProperties().ConfigureAwait(false);
+        } catch (Exception) {
+            // link is dead; the hosting service's watchdog handles reconnection
+        }
+    }
 
     /// <summary>
     /// <para>Poll for updates to <see cref="ActualTemperature"/>, <see cref="DesiredTemperature"/>, and <see cref="IsRunning"/>.</para>
@@ -181,7 +208,12 @@ public class AnovaPrecisionCooker: ISousVide {
 
             await SendCommandInternal(command).ConfigureAwait(false);
 
+#if NET6_0_OR_GREATER
+            // [anovaslop patch] bound the wait so a dead link fails fast instead of hanging the caller forever
+            return await currentResponseHandler.Task.WaitAsync(ResponseTimeout).ConfigureAwait(false);
+#else
             return await currentResponseHandler.Task.ConfigureAwait(false);
+#endif
         } finally {
             currentResponseHandler = null;
             serializeRequestsMutex.Release();
@@ -201,6 +233,7 @@ public class AnovaPrecisionCooker: ISousVide {
     /// <param name="e">response bytes</param>
     protected virtual void OnResponseReceived(object? sender, GattCharacteristicValueChangedEventArgs e) {
         if (e.Value is { } value) {
+            Interlocked.Exchange(ref lastResponseAtUtcTicks, DateTimeOffset.UtcNow.UtcTicks); // [anovaslop patch]
             string message = Encoding.GetString(value).Trim();
             Trace.WriteLine(message, "ble-rx");
             if (message != ResponseInvalidCommand && currentResponseHandler != null) {
@@ -243,7 +276,8 @@ public class AnovaPrecisionCooker: ISousVide {
     }
 
     private void onDisconnection(object? sender, EventArgs e) {
-        isConnected = false;
+        isConnected   = false;
+        timer.Enabled = false; // [anovaslop patch] stop polling a dead link so requests don't pile up behind the mutex
     }
 
     /// <inheritdoc cref="Dispose()" />
