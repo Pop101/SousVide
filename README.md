@@ -5,8 +5,14 @@
 
 *Bluetooth client library and protocol specification for the Anova Precision Cooker sous vide.*
 
+![Anova Precision Cooker](https://raw.githubusercontent.com/Aldaviva/SousVide/master/.github/images/readme-header.jpg)
+
+## Table of contents
+
 <!-- MarkdownTOC autolink="true" bracket="round" autoanchor="false" levels="1,2,3,4" bullets="1." -->
 
+1. [Why this fork](#why-this-fork)
+1. [Technologies](#technologies)
 1. [Background](#background)
     1. [Device](#device)
     1. [Cash Grab](#cash-grab)
@@ -26,7 +32,14 @@
 
 <!-- /MarkdownTOC -->
 
-![Anova Precision Cooker](https://raw.githubusercontent.com/Aldaviva/SousVide/master/.github/images/readme-header.jpg)
+## Why this fork
+
+Forked from [Aldaviva/SousVide](https://github.com/Aldaviva/SousVide). No code differences from upstream were found on the default branch at the time of this update. A separate reason for the fork isn’t documented.
+
+## Technologies
+
+[C#](https://learn.microsoft.com/dotnet/csharp/) · [.NET](https://dotnet.microsoft.com/) · [InTheHand BluetoothLE](https://www.nuget.org/packages/InTheHand.BluetoothLE)
+
 
 ## Background
 
